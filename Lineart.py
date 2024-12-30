@@ -34,7 +34,7 @@ def call_lineart(output_dir, positive_prompt, image_path, seed=134176473189985):
                 negative_condition,
                 control_net,
                 image,
-                1, 0, 1,
+                0.7, 0, 1,
                 vae
             )
             

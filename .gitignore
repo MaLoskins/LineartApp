@@ -29,4 +29,5 @@ yarn-error.log*
 /comfyui.log
 /comfyui.prev.log
 /comfyui.prev2.log
-/input/images
+/input/images/*
+/output/images/*

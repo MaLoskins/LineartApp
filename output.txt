@@ -7,14 +7,14 @@ from flask_cors import CORS
 import os
 import uuid
 import time
-from Lineart import call_lineart
 import random
 from threading import Lock
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all domains on all routes
+from Lineart import call_lineart
 
-# Define absolute paths for input and output directories
+app = Flask(__name__)
+CORS(app)
+
 BASE_DIR = os.path.abspath(os.getcwd())
 INPUT_DIR = os.path.join(BASE_DIR, "input", "images")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output", "images")
@@ -23,11 +23,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 processing_lock = Lock()
 
-def is_file_accessible(filepath, mode='r'):
-    """
-    Check if a file is accessible.
-    Tries to open the file with the given mode.
-    """
+def is_file_accessible(filepath, mode='rb'):
+    """Check if a file is accessible with the given mode."""
     try:
         with open(filepath, mode):
             return True
@@ -41,15 +38,36 @@ def wait_for_file(filepath, timeout=60, check_interval=0.5):
     """
     start_time = time.time()
     while True:
-        if os.path.exists(filepath) and is_file_accessible(filepath, 'rb'):
+        if os.path.exists(filepath) and is_file_accessible(filepath):
             return True
         if time.time() - start_time > timeout:
             return False
         time.sleep(check_interval)
 
+def rename_with_retry(src_path, dst_path, max_retries=5, delay=1.0):
+    """
+    Attempt to rename a file with retry logic. Sleep if sharing violation occurs.
+    Returns True on success, False on repeated failure.
+    """
+    for attempt in range(max_retries):
+        try:
+            os.rename(src_path, dst_path)
+            return True
+        except PermissionError as e:
+            # WinError 32 -> file is in use by another process
+            if attempt < max_retries - 1:
+                print(f"Rename failed due to permission error. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                print(f"Rename failed after {max_retries} attempts: {e}")
+                return False
+        except OSError as e:
+            print(f"Unexpected error during rename: {e}")
+            return False
+    return False
+
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    # Check if the image and prompt are in the request
     if 'image' not in request.files:
         return jsonify({'error': 'No image part in the request'}), 400
     if 'prompt' not in request.form:
@@ -58,72 +76,53 @@ def upload_image():
     image = request.files['image']
     prompt = request.form['prompt']
 
-    # Validate the image
     if image.filename == '':
         return jsonify({'error': 'No selected image'}), 400
 
     try:
-        # Acquire lock to prevent race conditions
         with processing_lock:
-            # Generate a unique identifier for the submission
             unique_id = uuid.uuid4().hex
-
-            # Save the uploaded image with a unique filename
             original_filename = f"Temp_{unique_id}.png"
             image_path = os.path.join(INPUT_DIR, original_filename)
             image.save(image_path)
 
-            # Create random seed for the model (digits only)
             seed = random.randint(100000000000000, 999999999999999)
 
-            # Call the existing lineart function
+            # Call your lineart function (this calls ComfyUI in the background)
             call_lineart(OUTPUT_DIR, prompt, image_path, seed)
 
-            # Path to the edited image
             edited_image_source_path = os.path.join(OUTPUT_DIR, 'image.png')
-
-            # Wait until 'image.png' is created and accessible
             if not wait_for_file(edited_image_source_path):
                 return jsonify({'error': 'Processing timed out. Edited image not found.'}), 500
 
-            # Implement retry logic for renaming the file
-            max_retries = 5
-            wait_time = 1  # seconds
-            for attempt in range(max_retries):
-                try:
-                    # Generate a unique filename for the edited image
-                    edited_unique_filename = f"image_{unique_id}.png"
-                    edited_image_destination_path = os.path.join(OUTPUT_DIR, edited_unique_filename)
+            edited_unique_filename = f"image_{unique_id}.png"
+            edited_image_destination_path = os.path.join(OUTPUT_DIR, edited_unique_filename)
 
-                    # Rename the edited image to the unique filename
-                    os.rename(edited_image_source_path, edited_image_destination_path)
-                    break  # Rename successful, exit the loop
-                except OSError as e:
-                    if e.errno == 32:  # ERROR_SHARING_VIOLATION
-                        if attempt < max_retries - 1:
-                            time.sleep(wait_time)  # Wait before retrying
-                        else:
-                            return jsonify({'error': 'File is in use and cannot be renamed.'}), 500
-                    else:
-                        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+            success = rename_with_retry(edited_image_source_path, edited_image_destination_path)
+            if not success:
+                return jsonify({'error': 'File is in use and cannot be renamed after several retries.'}), 500
 
-            # Optionally, remove the original uploaded image to save space
-            os.remove(image_path)
+            # Remove original file to save space
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
 
-            # Serve the edited image via a static route
             edited_image_url = f'/static/images/{edited_unique_filename}'
-
             return jsonify({'editedImageUrl': edited_image_url}), 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Route to serve edited images
 @app.route('/static/images/<filename>')
 def serve_image(filename):
     return send_from_directory(OUTPUT_DIR, filename)
 
 if __name__ == '__main__':
+    # Make sure you see something like this at the bottom.
+    # If the console is instantly closing, run it from CMD:
+    #   python app.py
+    # so you can read the traceback if it crashes.
     app.run(host='0.0.0.0', port=5000, debug=True)
 
 
@@ -137,10 +136,6 @@ if __name__ == '__main__':
 ```
 import os
 import sys
-
-# Activate the virtual environment if not already activated
-# For Windows: .venv\Scripts\activate
-# For Unix or MacOS: source .venv/bin/activate
 
 # For environment: C:\AI\stable-diffusion-webui-forge\venv\Scripts\activate.bat
 # OR GIT Bash:
@@ -161,7 +156,7 @@ def call_lineart(output_dir, positive_prompt, image_path, seed=134176473189985):
             # Load models
             model, clip, vae = CheckpointLoaderSimple('dreamshaper_8.safetensors')
             positive_condition = CLIPTextEncode(positive_prompt, clip)
-            negative_condition = CLIPTextEncode('NSFW, Nude, naked, uncensored', clip)
+            negative_condition = CLIPTextEncode('uncensored', clip)
             
             # Load ControlNet
             control_net = ControlNetLoader('controlnet11Models_lineart.safetensors')
@@ -175,7 +170,7 @@ def call_lineart(output_dir, positive_prompt, image_path, seed=134176473189985):
                 negative_condition,
                 control_net,
                 image,
-                1, 0, 1,
+                0.7, 0, 1,
                 vae
             )
             
