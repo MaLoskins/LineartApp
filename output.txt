@@ -1,0 +1,206 @@
+### /c/Users/matth/Desktop/LineartApp/./app.py:
+
+
+```
+from flask import Flask, request, send_from_directory, jsonify
+from flask_cors import CORS
+import os
+import uuid
+import time
+from Lineart import call_lineart
+import random
+from threading import Lock
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all domains on all routes
+
+# Define absolute paths for input and output directories
+BASE_DIR = os.path.abspath(os.getcwd())
+INPUT_DIR = os.path.join(BASE_DIR, "input", "images")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output", "images")
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+processing_lock = Lock()
+
+def is_file_accessible(filepath, mode='r'):
+    """
+    Check if a file is accessible.
+    Tries to open the file with the given mode.
+    """
+    try:
+        with open(filepath, mode):
+            return True
+    except IOError:
+        return False
+
+def wait_for_file(filepath, timeout=60, check_interval=0.5):
+    """
+    Wait until the file exists and is accessible.
+    Returns True if the file is accessible within the timeout, False otherwise.
+    """
+    start_time = time.time()
+    while True:
+        if os.path.exists(filepath) and is_file_accessible(filepath, 'rb'):
+            return True
+        if time.time() - start_time > timeout:
+            return False
+        time.sleep(check_interval)
+
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    # Check if the image and prompt are in the request
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image part in the request'}), 400
+    if 'prompt' not in request.form:
+        return jsonify({'error': 'No prompt provided'}), 400
+
+    image = request.files['image']
+    prompt = request.form['prompt']
+
+    # Validate the image
+    if image.filename == '':
+        return jsonify({'error': 'No selected image'}), 400
+
+    try:
+        # Acquire lock to prevent race conditions
+        with processing_lock:
+            # Generate a unique identifier for the submission
+            unique_id = uuid.uuid4().hex
+
+            # Save the uploaded image with a unique filename
+            original_filename = f"Temp_{unique_id}.png"
+            image_path = os.path.join(INPUT_DIR, original_filename)
+            image.save(image_path)
+
+            # Create random seed for the model (digits only)
+            seed = random.randint(100000000000000, 999999999999999)
+
+            # Call the existing lineart function
+            call_lineart(OUTPUT_DIR, prompt, image_path, seed)
+
+            # Path to the edited image
+            edited_image_source_path = os.path.join(OUTPUT_DIR, 'image.png')
+
+            # Wait until 'image.png' is created and accessible
+            if not wait_for_file(edited_image_source_path):
+                return jsonify({'error': 'Processing timed out. Edited image not found.'}), 500
+
+            # Implement retry logic for renaming the file
+            max_retries = 5
+            wait_time = 1  # seconds
+            for attempt in range(max_retries):
+                try:
+                    # Generate a unique filename for the edited image
+                    edited_unique_filename = f"image_{unique_id}.png"
+                    edited_image_destination_path = os.path.join(OUTPUT_DIR, edited_unique_filename)
+
+                    # Rename the edited image to the unique filename
+                    os.rename(edited_image_source_path, edited_image_destination_path)
+                    break  # Rename successful, exit the loop
+                except OSError as e:
+                    if e.errno == 32:  # ERROR_SHARING_VIOLATION
+                        if attempt < max_retries - 1:
+                            time.sleep(wait_time)  # Wait before retrying
+                        else:
+                            return jsonify({'error': 'File is in use and cannot be renamed.'}), 500
+                    else:
+                        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+
+            # Optionally, remove the original uploaded image to save space
+            os.remove(image_path)
+
+            # Serve the edited image via a static route
+            edited_image_url = f'/static/images/{edited_unique_filename}'
+
+            return jsonify({'editedImageUrl': edited_image_url}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Route to serve edited images
+@app.route('/static/images/<filename>')
+def serve_image(filename):
+    return send_from_directory(OUTPUT_DIR, filename)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+
+```
+
+
+
+### /c/Users/matth/Desktop/LineartApp/./Lineart.py:
+
+
+```
+import os
+import sys
+
+# Activate the virtual environment if not already activated
+# For Windows: .venv\Scripts\activate
+# For Unix or MacOS: source .venv/bin/activate
+
+# For environment: C:\AI\stable-diffusion-webui-forge\venv\Scripts\activate.bat
+# OR GIT Bash:
+# source C:/AI/stable-diffusion-webui-forge/venv/Scripts/activate
+
+# To Create Comfy Script (Comfy must be running): python -m comfy_script.transpile <workflow>.json
+
+# Import ComfyScript modules
+sys.path.append(r'C:\AI\ComfyUI\custom_nodes\ComfyScript\src')
+from comfy_script.runtime import *
+load()  # Load ComfyUI
+from comfy_script.runtime.nodes import *
+
+def call_lineart(output_dir, positive_prompt, image_path, seed=134176473189985):
+    try:
+        print(f"call_lineart called with output_dir: {output_dir}, prompt: '{positive_prompt}', image_path: {image_path}")
+        with Workflow():
+            # Load models
+            model, clip, vae = CheckpointLoaderSimple('dreamshaper_8.safetensors')
+            positive_condition = CLIPTextEncode(positive_prompt, clip)
+            negative_condition = CLIPTextEncode('NSFW, Nude, naked, uncensored', clip)
+            
+            # Load ControlNet
+            control_net = ControlNetLoader('controlnet11Models_lineart.safetensors')
+            
+            # Load image
+            image, _ = LoadImage(image_path)
+            
+            # Apply ControlNet
+            positive, negative = ControlNetApplyAdvanced(
+                positive_condition,
+                negative_condition,
+                control_net,
+                image,
+                1, 0, 1,
+                vae
+            )
+            
+            # Generate latent image
+            latent = EmptyLatentImage(720, 720, 1)
+            latent = KSampler(
+                model, seed, 20, 6,
+                'dpmpp_2s_ancestral', 'karras',
+                positive, negative,
+                latent, 1
+            )
+            
+            # Decode image
+            image2 = VAEDecode(latent, vae)
+            
+            # Save image
+            edited_image_path = os.path.join(output_dir, "image.png")
+            JWImageSaveToPath(edited_image_path, image2, 'true')
+            print(f"Edited image saved at {edited_image_path}")
+        
+    except Exception as e:
+        print(f"An error occurred in call_lineart: {e}")
+
+
+```
+
+
+
